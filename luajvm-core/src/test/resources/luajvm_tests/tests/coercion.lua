@@ -1,0 +1,10 @@
+-- 调试版
+local sb = luajava.newInstance("java.lang.StringBuilder")
+print("sb ok: " .. tostring(sb))
+local ok1, e1 = pcall(function() return sb.append(123) end)
+print("append(123): ok=" .. tostring(ok1) .. " e=" .. tostring(e1))
+local ok2, e2 = pcall(function() return sb.append("s") end)
+print("append(str): ok=" .. tostring(ok2) .. " e=" .. tostring(e2))
+local ok3, e3 = pcall(function() return luajava.newInstance("java.lang.String", "hello") end)
+print("newInstance(String): ok=" .. tostring(ok3) .. " e=" .. tostring(e3))
+print("DONE03")

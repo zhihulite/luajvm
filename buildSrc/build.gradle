@@ -1,0 +1,10 @@
+// CoreRewriter/ArtifactSniffer 宿主；坐标经 settings 的版本目录复用主仓 toml
+plugins { id 'java-library' }
+
+repositories { mavenCentral() }
+
+dependencies {
+    api libs.asm
+    api libs.asm.commons
+    api libs.animal.sniffer
+}

@@ -1,0 +1,9 @@
+// 复用主仓的版本目录（Gradle 支持 from(files(...)) 导入）
+dependencyResolutionManagement {
+    versionCatalogs {
+        libs {
+            from(files('../gradle/libs.versions.toml'))
+        }
+    }
+}
+rootProject.name = 'buildSrc'

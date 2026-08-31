@@ -1,0 +1,65 @@
+# Baseline Profile（消费者基线配置）—— luajvm 引擎的 ART AOT 预编译清单
+#
+# 【为什么需要】Android 上引擎的冷启动成本主要是 ART 的 JIT 预热，不是引擎算法。
+# 设备实测（Hydrogen 设置页 13 item 的 loadlayout 累计，同一份 release APK，
+# 用 `cmd package compile` 在 verify/speed 之间切基线 —— 满足 docs/performance.md
+# 「测量纪律」要求的「同一份 class 输出切基线」）：全量 AOT 相对 JIT 的中位数明显更快，
+# 两组读数区间完全不重叠。
+#
+# 全量 AOT 是上界；本文件是它的「可发布子集」—— 把引擎自己的热路径列进 profile，
+# ART 在安装期/后台 dexopt 就把它们编译好，宿主 app 无需任何改动即可受益。
+#
+# 【只对 release 构建有效】debuggable 应用 ART 一律拒绝 AOT
+# （`cmd package compile -m speed -f` 会报 Success 但 status 仍是 verify）。
+#
+# 【格式】ART 人类可读 profile（HRF）：
+#   H = Hot（被多次调用）  S = Startup（启动期用到）  P = Post-startup
+#   `Lpkg/Cls;` 单独一行 = 类记录（让 ART 预加载该类）
+#   通配符由 profgen 处理：`*` 不跨 `/`，`**` 跨包
+# 规则不匹配任何方法时**静默丢弃**，所以有 `AndroidStaticGatesTest.baselineProfile`
+# 门禁校验每条规则的类前缀都真实存在（避免改包名后 profile 变哑弹）。
+
+# ---------- 核心值模型与 VM（每条 opcode 都走）----------
+HSPLorg/luajvm/core/LuaValue;->**(**)**
+HSPLorg/luajvm/core/LuaString;->**(**)**
+HSPLorg/luajvm/core/LuaTable;->**(**)**
+HSPLorg/luajvm/core/LuaInteger;->**(**)**
+HSPLorg/luajvm/core/LuaFloat;->**(**)**
+HSPLorg/luajvm/core/LuaNumber;->**(**)**
+HSPLorg/luajvm/core/LuaNil;->**(**)**
+HSPLorg/luajvm/core/LuaBoolean;->**(**)**
+HSPLorg/luajvm/core/LuaClosure;->**(**)**
+HSPLorg/luajvm/core/LuaFunction;->**(**)**
+HSPLorg/luajvm/core/LuaUserdata;->**(**)**
+HSPLorg/luajvm/core/LuaThread;->**(**)**
+HSPLorg/luajvm/core/Globals;->**(**)**
+HSPLorg/luajvm/core/Varargs;->**(**)**
+HSPLorg/luajvm/vm/**;->**(**)**
+HSPLorg/luajvm/vm/**;->**(**)**
+
+# ---------- Java 绑定层（loadlayout 每个属性/方法都走）----------
+HSPLorg/luajvm/bind/**;->**(**)**
+
+# ---------- 标准库与编译器（首次 load 脚本必走）----------
+HSPLorg/luajvm/lib/**;->**(**)**
+HSPLorg/luajvm/compiler/**;->**(**)**
+HSPLorg/luajvm/spi/**;->**(**)**
+
+# ---------- Android 宿主层（布局构建、引擎装配）----------
+HSPLorg/luajvm/android/engine/**;->**(**)**
+HSPLorg/luajvm/android/host/**;->**(**)**
+HSPLorg/luajvm/android/widget/**;->**(**)**
+HSPLorg/luajvm/android/util/**;->**(**)**
+HSPLorg/luajvm/android/lib/**;->**(**)**
+
+# ---------- 类记录：让 ART 预加载（省掉逐个类的 verify+init）----------
+Lorg/luajvm/core/**;
+Lorg/luajvm/vm/**;
+Lorg/luajvm/bind/**;
+Lorg/luajvm/lib/**;
+Lorg/luajvm/compiler/**;
+Lorg/luajvm/spi/**;
+Lorg/luajvm/android/engine/**;
+Lorg/luajvm/android/host/**;
+Lorg/luajvm/android/widget/**;
+Lorg/luajvm/android/lib/**;

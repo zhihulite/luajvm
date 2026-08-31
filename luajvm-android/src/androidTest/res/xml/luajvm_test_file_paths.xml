@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 测试 APK 的 FileProvider 根。库不声明 provider（由宿主注册），
+     但 UriPathInstrumentedTest 要生成 content:// Uri 才能验 SAF 回落。 -->
+<paths>
+    <files-path name="files" path="." />
+    <cache-path name="cache" path="." />
+</paths>

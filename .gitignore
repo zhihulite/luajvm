@@ -1,0 +1,54 @@
+# Gradle
+.gradle/
+build/
+
+# 本机专属：SDK 路径
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# Java
+*.class
+*.jar
+# Gradle wrapper 的 jar 必须入库，否则新克隆无法执行 ./gradlew
+!gradle/wrapper/gradle-wrapper.jar
+*.war
+*.ear
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Lua
+luac.out
+tmp/
+*.tmp
+debug_*.lua
+test_*.lua
+test_*.txt
+bench_*.lua
+mb_*.lua
+microbench/
+time-debug.txt
+*.jfr
+jfr_*.txt
+
+# 预编译字节码：构建产物，就地生成在 assets 下
+*.luac
+
+# 性能/设备审计的临时工作区（一次性证据，不进版本库）
+.audit/
+tools/
+
+# 编辑器副本
+*副本*
+
+# OS
+Thumbs.db
+.DS_Store

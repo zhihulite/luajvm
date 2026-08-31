@@ -1,0 +1,145 @@
+// 第二层制品：luajvm-core 的 Android 兼容版。
+//   直接编译 core 源码（JDK 21，无 android.jar 限制），jar 产物经 CoreRewriter 重写，
+//   sniffArtifact（Animal Sniffer）对重写后的 jar 做 API 24 签名核对。
+//   core（第三层）零改动；桌面用途继续用 luajvm-core 原始坐标。
+buildscript {
+    repositories { mavenCentral() }
+    dependencies {
+        classpath libs.asm
+        classpath libs.asm.commons
+    }
+}
+
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    withSourcesJar()
+    withJavadocJar()
+}
+
+// core 源码并入本模块（tools 为构建期桌面工具，不进 Android 制品）
+sourceSets {
+    main {
+        java {
+            srcDir '../luajvm-core/src/main/java'
+            exclude 'org/luajvm/tools/**'
+        }
+    }
+}
+
+import org.luajvm.rewriter.CoreRewriter
+import org.luajvm.rewriter.Rewrite
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+
+def rewrites = [
+        new Rewrite('java/io/InputStream', 'readAllBytes', 'readAllBytes', 'java/io/InputStream'),
+        new Rewrite('java/io/OutputStream', 'nullOutputStream', 'nullOutputStream', null, true),
+        new Rewrite('java/lang/reflect/Executable', 'getParameterTypes', 'parameterTypes', 'java/lang/reflect/Member'),
+        new Rewrite('java/lang/reflect/Executable', 'getModifiers', 'modifiers', 'java/lang/reflect/Member'),
+        new Rewrite('java/io/ByteArrayOutputStream', 'toString', 'toString', 'java/io/ByteArrayOutputStream', false, 'Ljava/nio/charset/Charset;'),
+        new Rewrite('java/lang/ThreadLocal', 'withInitial', 'withInitial', null, true, 'Ljava/util/function/Supplier;'),
+        new Rewrite('java/util/Arrays', 'equals', 'equals', null, true, '[BII[BII'),
+]
+def compatOwner = 'org/luajvm/android/compat/JavaApiCompat'
+
+// jar 产物重写全部 core 类为 Android 兼容字节码（完备性由 sniffArtifact 签名核对保证）
+tasks.named('jar') {
+    doLast {
+        def jarFile = archiveFile.get().asFile
+        def tmp = new File(jarFile.parentFile, jarFile.name + '.tmp')
+        int rewritten = 0
+        def rewriter = new CoreRewriter(rewrites, compatOwner)
+        new ZipFile(jarFile).withCloseable { zip ->
+            new ZipOutputStream(new FileOutputStream(tmp)).withCloseable { zos ->
+                zip.entries().each { e ->
+                    if (e.isDirectory()) return
+                    def bytes = zip.getInputStream(e).withCloseable { it.readAllBytes() }
+                    if (e.name.endsWith('.class')
+                            && !e.name.startsWith('org/luajvm/android/compat/')) {
+                        bytes = rewriter.rewrite(bytes)
+                        rewritten++
+                    }
+                    zos.putNextEntry(new ZipEntry(e.name))
+                    zos.write(bytes)
+                    zos.closeEntry()
+                }
+            }
+        }
+        Files.move(tmp.toPath(), jarFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        logger.lifecycle("rewriteCoreIntoAndroid: 重写 ${rewritten} 个类")
+    }
+}
+
+configurations {
+    snifferSignature
+}
+
+dependencies {
+    // 签名包带 classifier（coreLib2.signature），版本目录不支持 classifier 故字面量
+    snifferSignature 'com.toasttab.android:gummy-bears-api-24:0.15.0:coreLib2@signature'
+}
+
+// 制品级 API-24 门禁：Animal Sniffer 对重写后的 jar 做签名核对。
+//   重写覆盖项已变 compat 调用（API 24 安全）自然通过；未覆盖的超版本 API 直接失败。
+//   PackageLib 的 nio/ProcessHandle 引用是 isWindows() 守卫的 Windows 死码，Android 不可达
+tasks.register('sniffArtifact') {
+    dependsOn tasks.named('jar')
+    doLast {
+        def signature = configurations.snifferSignature.singleFile
+        def jarFile = tasks.named('jar', Jar).get().archiveFile.get().asFile
+        def violations = org.luajvm.build.ArtifactSniffer.check(
+                signature, jarFile,
+                ['org.luajvm.*', 'org.codehaus.mojo.animal_sniffer.*'] as Set)
+        // 不可达引用排除：PackageLib 为 isWindows() 守卫的 Windows 死码；LuaThread$1 为
+        // 无 SPI 注入时的虚拟线程默认实现（Android 恒有 AndroidCoroutineThreads 注入，永不执行）；
+        // Record.<init> 由 D8 在 app 打 dex 时做 record backport（API 33 以下自动改写）
+        def unreachable = ['org/luajvm/lib/PackageLib', 'org/luajvm/core/LuaThread$1', 'Record.<init>']
+        def real = violations.readLines().findAll { line ->
+            line.contains('Undefined reference') && !unreachable.any { line.contains(it) }
+        }
+        if (!real.isEmpty()) {
+            throw new GradleException("sniffArtifact 失败（制品存在 API 24 之外的引用）：\n" + real.join('\n'))
+        }
+        logger.lifecycle("sniffArtifact: 通过（API 24 签名核对）")
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            artifactId = 'luajvm-core-android'
+            pom {
+                name = 'luajvm-core-android'
+                description = 'luajvm-core 的 Android 兼容版：构建期重写超 minSdk API 调用（readAllBytes/Executable 等）为 JavaApiCompat。'
+                url = 'https://github.com/zhihulite/luajvm'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://github.com/zhihulite/luajvm/blob/main/LICENSE'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'zhihulite'
+                        name = 'zhihulite'
+                    }
+                }
+                scm {
+                    url = 'https://github.com/zhihulite/luajvm'
+                    connection = 'scm:git:https://github.com/zhihulite/luajvm.git'
+                }
+            }
+        }
+    }
+}

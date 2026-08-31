@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  测试 APK 的清单。
+
+  Application 指定 LuaApplication：宿主（Hydrogen）的 Application 即继承它，
+  仪器化测试因此测到的是生产装配，而不是测试专用旁路。LuaClassProxy 的 dex 缓存目录、
+  sGlobalData、SharedData 都挂在 Application 上，缺了它 luajava.override 拿不到
+  codeCacheDir。
+
+  LuaActivity 在此声明：主 manifest 是空清单（库不声明组件，由宿主自行注册），
+  但仪器化测试要驱动 Activity 就必须有可启动的声明。主题必须是 AppCompat 系，
+  否则 AppCompatActivity 在 onCreate 抛 IllegalStateException。
+
+  usesCleartextTraffic 只为测 http:// 明文请求（API 28+ 默认禁）：库的主清单不设它，
+  宿主自行决定是否放开。
+
+  androidTest 不进 AAR，故不影响发布制品。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- SyncHttpInstrumentedTest 发真请求（example.com）需要联网权限。
+         库的主清单不声明权限（由宿主自行申请），故只在测试 APK 里加。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:name="org.luajvm.android.LuaApplication"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name="org.luajvm.android.host.LuaActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AppCompat.DayNight.NoActionBar" />
+
+        <!-- authority 须是 packageName + ".FileProvider"，与 LuaIntentHelper.getUriForFile
+             拼的串一致；UriPathInstrumentedTest 靠它生成 content:// Uri 验 SAF 回落。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.FileProvider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/luajvm_test_file_paths" />
+        </provider>
+    </application>
+</manifest>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- lint 的 minSdk 输入：JVM 模型的 SDK 字段为空时，lint 读模块根的此文件 -->
+    <uses-sdk android:minSdkVersion="24" />
+</manifest>
