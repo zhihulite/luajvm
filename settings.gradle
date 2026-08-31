@@ -1,0 +1,31 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        // 用 includeModule 只拦 material 一个模块，其余 com.google.* 仍走 google()
+        google()
+        maven {
+            name = 'zhihulite-releases'
+            url = 'https://raw.githubusercontent.com/zhihulite/maven-repository/main/repository/releases'
+            content {
+                includeModule 'com.google.android.material', 'material'
+            }
+        }
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }   // PhotoView（com.github.Baseflow）唯一来源
+    }
+}
+rootProject.name = "luajvm"
+include ':luajvm-core'
+include ':luajvm-android'

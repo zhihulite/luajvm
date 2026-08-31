@@ -1,0 +1,54 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.android.library) apply false
+}
+
+// ── 制品发布：写入自建 Maven 仓库的本地工作副本 ──────────────────────────────
+//   发布不走 HTTP 上传，而是往 mavenRepoDir 写文件，再由 git push 分发。
+//   这样"更新包/删包"就等价于改文件后提交，不依赖任何服务端的不可变约定。
+//   坐标与版本集中在此，避免两个模块各写一份而错配（android api 依赖 core）。
+//
+// publishableModules 是白名单而非"谁应用了插件就配谁"：新增模块一旦应用
+// maven-publish 就会凭空多出一整套 publish 任务并被静默发出去。改为显式列举后，
+// 未列名模块一旦应用该插件即构建失败。
+// 两个模块的 src/test 里有大量门禁代码与 Lua 套件，但 test 源集不进制品
+// （withSourcesJar 只打 main），故不影响发布内容。
+def publishableModules = ['luajvm-core', 'luajvm-android'] as Set
+
+subprojects {
+    plugins.withId('maven-publish') {
+        if (!(project.name in publishableModules)) {
+            throw new GradleException(
+                    "模块 '${project.name}' 应用了 maven-publish，但不在根 build.gradle 的 " +
+                    "publishableModules 白名单内。若确实要发布它，请显式加入白名单；" +
+                    "否则移除该插件。")
+        }
+        group = luajvmGroup
+        version = luajvmVersion
+
+        publishing {
+            repositories {
+                maven {
+                    name = 'zhihuliteMavenRepository'
+                    // SNAPSHOT 与正式版分区存放：消费方可只声明其中一个，
+                    // 从而不会误把开发版解析进发布构建。
+                    //
+                    // 通道由版本号后缀决定，且与 -PpublishChannel 交叉校验：
+                    // 只按后缀隐式判定时，忘写 -SNAPSHOT 就会把开发版发成正式版，
+                    // 而正式版按约定不该被覆盖。显式声明能让这种手滑当场失败。
+                    def isSnapshot = version.toString().endsWith('SNAPSHOT')
+                    def channel = isSnapshot ? 'snapshots' : 'releases'
+                    def declared = project.findProperty('publishChannel')
+                    if (declared != null && declared != channel) {
+                        throw new GradleException(
+                                "-PpublishChannel=${declared} 与版本号 '${version}' 不符：" +
+                                "该版本号会发往 '${channel}'。带 -SNAPSHOT 后缀发 snapshot，" +
+                                "不带则发 release。")
+                    }
+                    url = uri("${rootDir}/${mavenRepoDir}/repository/${channel}")
+                }
+            }
+        }
+    }
+}

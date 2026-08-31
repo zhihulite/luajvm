@@ -1,0 +1,693 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'jacoco'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    withSourcesJar()
+    withJavadocJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs.add('-Xlint:deprecation')
+    options.compilerArgs.add('-Xlint:unchecked')
+    options.encoding = 'UTF-8'
+}
+
+// 守卫：LuaVM.execute 的字节码大小。越过 C2 HugeMethodLimit（8000 字节）会让整个
+// execute 退回解释执行，造成数量级回归——这是全引擎唯一逼近该限制的方法，故单点守卫。
+// 解析 class 二进制的 Code attribute 取精确 code_length（字节数），即 HotSpot
+// 比较的 method->code_size()；指令数不能替代，单条指令可携带大量操作数与跳转表。
+// 同类里其余方法一并打印作余量参照，完整清单落 build/vm-execute-method-size.txt。
+// 用法：
+//   gradlew :luajvm-core:checkVMExecuteMethodSize
+//   gradlew :luajvm-core:checkVMExecuteMethodSize -PmethodCodeLength=7000
+//   gradlew :luajvm-core:checkVMExecuteMethodSize -PmethodSizeTop=20   # TOP-N 条数
+def methodCodeLength = (project.findProperty('methodCodeLength') ?: 8000) as int
+
+// —— class 文件二进制解析（big-endian）——
+def readU2 = { byte[] b, int p -> ((b[p] & 0xFF) << 8) | (b[p + 1] & 0xFF) }
+def readU4 = { byte[] b, int p -> ((b[p] & 0xFF) << 24) | ((b[p + 1] & 0xFF) << 16) | ((b[p + 2] & 0xFF) << 8) | (b[p + 3] & 0xFF) }
+
+// 解析单个 class：返回 [[name, codeLength], ...]
+def parseClassCodeLengths = { byte[] b, String origin ->
+    int pos = 8  // magic + minor + major
+    def cpCount = readU2(b, pos); pos += 2
+    def utf8 = [:]
+    int i = 1
+    while (i < cpCount) {
+        def tag = b[pos] & 0xFF; pos += 1
+        switch (tag) {
+            case 1:  // Utf8
+                def len = readU2(b, pos); pos += 2
+                utf8[i] = new String(b, pos, len, 'UTF-8')
+                pos += len
+                break
+            case 3: case 4: pos += 4; break
+            case 5: case 6: pos += 8; i++; break  // long/double 占 2 槽
+            case 7: case 8: case 16: case 19: case 20: pos += 2; break
+            case 9: case 10: case 11: case 12: case 17: case 18: pos += 4; break
+            case 15: pos += 3; break
+            default: throw new GradleException("checkVMExecuteMethodSize: 未知 constant pool tag ${tag} in ${origin}")
+        }
+        i++
+    }
+    pos += 6  // access_flags this_class super_class
+    def ifaces = readU2(b, pos); pos += 2 + ifaces * 2
+    def fields = readU2(b, pos); pos += 2
+    for (int fi = 0; fi < fields; fi++) {
+        pos += 6
+        def fac = readU2(b, pos); pos += 2
+        for (int ai = 0; ai < fac; ai++) {
+            def alen = readU4(b, pos + 2)
+            pos += 6 + alen
+        }
+    }
+    def methods = readU2(b, pos); pos += 2
+    def result = []
+    for (int mi = 0; mi < methods; mi++) {
+        def nameIdx = readU2(b, pos + 2)
+        def descIdx = readU2(b, pos + 4)
+        pos += 6
+        def mac = readU2(b, pos); pos += 2
+        def codeLen = 0
+        for (int ai = 0; ai < mac; ai++) {
+            def attrNameIdx = readU2(b, pos)
+            def alen = readU4(b, pos + 2)
+            if (utf8[attrNameIdx] == 'Code') {
+                // Code attribute: max_stack(2)+max_locals(2)+code_length(4)
+                codeLen = readU4(b, pos + 10)
+            }
+            pos += 6 + alen
+        }
+        result << [name: utf8[nameIdx] + utf8[descIdx], len: codeLen]
+    }
+    return result
+}
+
+tasks.register('checkVMExecuteMethodSize') {
+    group = 'verification'
+    description = '校验 LuaVM.execute 的 code_length 不超 C2 HugeMethodLimit(8000 字节)。'
+    dependsOn compileJava
+    doLast {
+        def classFile = file("$buildDir/classes/java/main/org/luajvm/vm/LuaVM.class")
+        // 前置自检：class 缺失须失败退出，否则门禁零输出零断言即通过
+        if (!classFile.isFile()) {
+            throw new GradleException(
+                    "checkVMExecuteMethodSize: 找不到 LuaVM.class，门禁无法判定：${classFile}")
+        }
+
+        final String TARGET_METHOD = 'execute'
+        def methods = parseClassCodeLengths(classFile.bytes, classFile.name)
+        def target = methods.findAll { it.name.startsWith(TARGET_METHOD + '(') && it.len > 0 }
+        if (target.isEmpty()) {
+            throw new GradleException("checkVMExecuteMethodSize: LuaVM 里找不到带 Code 的 " +
+                    "${TARGET_METHOD} 方法，门禁空转（现有方法：" +
+                    methods.collect { it.name }.take(20).join(', ') + "）")
+        }
+
+        def violations = target.findAll { it.len > methodCodeLength }
+        if (!violations.isEmpty()) {
+            throw new GradleException(
+                    "❌ LuaVM.execute 超过 C2 HugeMethodLimit ${methodCodeLength} 字节，" +
+                            "整个方法会退回解释执行：\n" +
+                            violations.collect { "   - ${it.name} | code_length: ${it.len} 字节" }.join('\n')
+            )
+        }
+
+        // 同类其余方法作余量参照：改动 execute 常伴随把冷逻辑拆出去，需要看拆到哪里了
+        def sorted = methods.findAll { it.len > 0 }.sort { -it.len }
+        def topN = (project.findProperty('methodSizeTop') ?: 10) as int
+        def report = file("$buildDir/vm-execute-method-size.txt")
+        report.text = ("# checkVMExecuteMethodSize ${new Date()}\n" +
+                "# 阈值 ${methodCodeLength} 字节；来源 ${classFile}\n" +
+                "# LuaVM 共 ${sorted.size()} 个带 Code 方法\n" +
+                sorted.collect { String.format("%6d  %s", it.len, it.name) }.join('\n')) + '\n'
+
+        def maxTarget = target.max { it.len }
+        println "   LuaVM 同类方法 TOP${topN}（完整清单 ${report.name}）:"
+        sorted.take(topN).each { m ->
+            println String.format("     %6d 字节  %s%s", m.len, m.name,
+                    m.name.startsWith(TARGET_METHOD + '(') ? '   <= 被守卫' : '')
+        }
+        println String.format("✅ LuaVM.execute = %d 字节，余量 %d 字节（阈值 %d）",
+                maxTarget.len, methodCodeLength - maxTarget.len, methodCodeLength)
+    }
+}
+
+// 修改 LuaVM.execute 后：
+//   1. 跑 checkVMExecuteMethodSize 看余量与 build/vm-execute-method-size.txt 的同类清单；
+//   2. 新冷逻辑优先拆独立方法，错误拆分也会损害内联，须 A/B 验证
+
+test {
+    useJUnitPlatform()
+    finalizedBy(jacocoTestReport)
+}
+
+jacoco {
+    toolVersion = '0.8.12'
+}
+
+jacocoTestReport {
+    reports {
+        xml.required = true
+        html.required = true
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            // groupId/version 由根 build.gradle 统一设定
+            artifactId = 'luajvm-core'
+            pom {
+                name = 'luajvm-core'
+                description = 'Lua 5.5.1 的纯 Java 移植：VM、标准库与 Java 绑定层。'
+                url = 'https://github.com/zhihulite/luajvm'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://github.com/zhihulite/luajvm/blob/main/LICENSE'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'zhihulite'
+                        name = 'zhihulite'
+                    }
+                }
+                scm {
+                    url = 'https://github.com/zhihulite/luajvm'
+                    connection = 'scm:git:https://github.com/zhihulite/luajvm.git'
+                }
+            }
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 纯 JVM 测试层
+//   判据见 docs/GATES.md 的分层表：读 .java 源码 / .class 常量池 / 只测反射签名与
+//   纯算法的用例留本层；碰真实 Android API 的一律进 luajvm-android 的 androidTest。
+// ══════════════════════════════════════════════════════════════════════════
+
+test {
+    enabled = false
+}
+
+// 测试直接跑 class 输出目录，不解析也不构建 JAR。
+def testExecutionClasspath = files(sourceSets.test.output, sourceSets.main.output)
+
+
+def officialTestDirectory = file('src/test/resources/official_tests')
+def luajvmTestDirectory = file('src/test/resources/luajvm_tests')
+def lua55DebugExecutable = rootProject.file('build/lua55-debug/lua55-debug-5.5.1.exe')
+
+def configureClassDirectoryTest = { JavaExec task, String mainClassName ->
+    task.dependsOn 'classes', 'testClasses'
+    task.classpath = testExecutionClasspath
+    task.mainClass.set(mainClassName)
+    task.enableAssertions = true
+    // C 的 lua55-debug 编译时含 ltests.h，其宏覆盖必须逐条对齐（否则行为/字节码不同）：
+    //   LUAL_BUFFERSIZE=23、STRCACHE_N=23、STRCACHE_M=5、MAXINDEXRK=1、
+    //   LUAI_MAXSTACK=68000、LUAI_MAXCCALLS=180
+    // Java 侧全部经系统属性注入（引擎常量读 -Dluajvm.*，见 Globals/LuaVM/IoFile/LuaString/Opcodes）
+    task.jvmArgs(
+            '-Dluajvm.maxccalls=180',
+            '-Dluajvm.maxstack=68000',
+            '-Dluajvm.buffersize=23',
+            '-Dluajvm.strcachen=23',
+            '-Dluajvm.strcachem=5',
+            '-Dluajvm.maxindexrk=1'
+    )
+    // Continuation 模式（-Pcont=true）需要 JDK 内部包导出，否则 ContSupport 静态块
+    //   的冒烟会失败并静默回落线程模式 —— 那样测的就不是 cont 路径了。
+    if (task.project.hasProperty('cont')) {
+        task.jvmArgs('--add-exports', 'java.base/jdk.internal.vm=ALL-UNNAMED')
+    }
+    // java-only 开关透传：Gradle 命令行的 -D 落在 daemon 上，不会到 fork 出的测试 JVM，
+    //   必须用 -P 转成 fork JVM 的 -D。
+    ['dblhash', 'internstats', 'iforstats', 'vthread', 'corostack', 'kcacherecycle', 'flatloop', 'ifor', 'countcompile', 'luac', 'cont', 'shadowflat', 'luajava', 'countcfn', 'strjcache', 'bindfastcall', 'bindloadercache', 'bindinnerlazy'].each { name ->
+        if (task.project.hasProperty(name)) {
+            task.jvmArgs("-Dluajvm.${name}=${task.project.property(name)}")
+        }
+    }
+    // java-only: -Pjfr=<stem> 给 fork JVM 开 1ms JFR（仅定位，不得据此宣布提速）
+    if (task.project.hasProperty('jfr')) {
+        def dir = file("${rootProject.buildDir}/benchmarks")
+        dir.mkdirs()
+        def stem = task.project.property('jfr')
+        task.jvmArgs(
+                "-XX:StartFlightRecording=settings=${dir}/profile1ms.jfc,filename=${dir}/${stem}.jfr,dumponexit=true",
+                '-XX:FlightRecorderOptions=stackdepth=128'
+        )
+    }
+}
+
+// java-only: 用官方套件的完整装配（含 ltests 的 T 库）跑单个测试文件，供诊断用。
+//   用法：gradlew :luajvm-core:officialOne --args="memerr.lua"
+tasks.register('officialOne', JavaExec) {
+    group = 'verification'
+    description = '用官方装配（含 T 库）执行单个官方测试文件（参数：<相对套件目录的文件名>）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LuaOfficalTestRunner')
+}
+
+// java-only: JFR 采样跑官方聚合，仅用于定位热点，不得用其结果宣布提速。
+//   产物：build/benchmarks/official.jfr
+tasks.register('officialJfr', JavaExec) {
+    group = 'verification'
+    description = '带 JFR 采样执行官方聚合（仅定位热点用）。产物 build/benchmarks/official.jfr'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LuaOfficalTestRunner')
+    doFirst { file("${rootProject.buildDir}/benchmarks").mkdirs() }
+    // 默认 profile 的 10ms 采样在本套件只得 ~239 样本，不足以定位；用 1ms 自定义配置
+    jvmArgs(
+            "-XX:StartFlightRecording=settings=${rootProject.buildDir}/benchmarks/profile1ms.jfc,filename=${rootProject.buildDir}/benchmarks/official.jfr,dumponexit=true",
+            '-XX:FlightRecorderOptions=stackdepth=128'
+    )
+}
+
+// java-only: 性能 A/B —— 用 -Pdblhash=false 切回线性探测基线（同一份 class 输出）。
+//   A/B 两侧须同脚本、同 JVM 参数、同 class 来源。
+tasks.register('officialAb', JavaExec) {
+    group = 'verification'
+    description = '官方聚合 wall-time A/B（-Pdblhash=false 切线性探测基线）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LuaOfficalTestRunner')
+}
+
+tasks.register('officialTests', JavaExec) {
+    group = 'verification'
+    description = '执行 official_tests/run.lua（官方聚合套件入口，含 29 个单文件测试）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LuaOfficalTestRunner')
+    doFirst {
+        def runLua = officialTestDirectory.toPath().resolve('run.lua')
+        if (!runLua.toFile().exists()) {
+            throw new GradleException("缺少入口文件：${runLua}")
+        }
+        println "执行官方测试入口: ${runLua}"
+    }
+}
+
+tasks.register('officialAllTests', JavaExec) {
+    group = 'verification'
+    description = '使用 luajvm 运行 official_tests/run.lua（官方聚合套件入口）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.RunLuaFile')
+    args officialTestDirectory.toPath().resolve('run.lua').toAbsolutePath().toString(), '120'
+}
+
+// java-only: 执行任意单个 Lua 文件（替代手动"编译 class + java -cp"两步）——自动编译后执行。
+// 用法：gradlew :luajvm-core:runLuaFile --args="<lua文件路径> [超时秒]"
+tasks.register('runLuaFile', JavaExec) {
+    group = 'verification'
+    description = '用 luajvm 执行单个 Lua 文件（参数：<文件路径> [超时秒数]），自动编译。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.RunLuaFile')
+    doFirst {
+        if (args.isEmpty()) {
+            throw new GradleException("用法：gradlew :luajvm-core:runLuaFile --args=\"<lua文件路径> [超时秒]\"")
+        }
+    }
+}
+
+tasks.register('lua55DebugTests', Exec) {
+    group = 'verification'
+    description = '使用 lua55-debug 运行 official_tests/run.lua（同一官方聚合入口）。'
+    // run.lua 按 C 官方方式假定 cwd 是含 all.lua 的 lua-5.5.1-tests 目录。
+    workingDir officialTestDirectory.toPath().resolve('lua-5.5.1-tests').toFile()
+    doFirst {
+        if (!lua55DebugExecutable.isFile()) {
+            throw new GradleException("缺少 lua55-debug：${lua55DebugExecutable.absolutePath}，请先编译 Lua 5.5.1 debug/ltests 版本")
+        }
+    }
+    commandLine lua55DebugExecutable.absolutePath, '../run.lua'
+}
+
+tasks.register('luajvmTests', JavaExec) {
+    group = 'verification'
+    description = '执行 luajvm_tests/run.lua（Java 绑定测试聚合入口）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LuajvmTestRunner')
+    doFirst {
+        def runLua = luajvmTestDirectory.toPath().resolve('run.lua')
+        if (!runLua.toFile().exists()) {
+            throw new GradleException("缺少入口文件：${runLua}")
+        }
+        println "执行 Java 绑定测试入口: ${runLua}"
+    }
+}
+
+tasks.register('javaApiTests', JavaExec) {
+    group = 'verification'
+    description = '运行无法用 Lua 文件覆盖的 Java 公共 API 合约测试。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.JavaApiContractTest')
+}
+
+// java-only: 预编译字节码的 dump/load 合约。javaApiTests 不覆盖这条路径，而 Hydrogen 的
+//   -PluaMode=luac 正走 undump：strip 后仍可执行、5.5 chunk 头校验都在此。
+tasks.register('chunkTests', JavaExec) {
+    group = 'verification'
+    description = 'chunk dump/load round-trip、strip 语义与 Lua 5.5 chunk 头校验。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ChunkTest')
+}
+
+// java-only: 类初始化顺序冒烟——从 LuaString（而非 LuaValue）作为进程首次调用进入。
+//   必须独立进程运行：一旦同 JVM 里别的测试先碰过 LuaValue，此用例就永远通不了检验。
+tasks.register('classInitOrderTests', JavaExec) {
+    group = 'verification'
+    description = '以 LuaString 为进程首次 luajvm 调用，验证类静态初始化顺序无重入 NPE。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ClassInitOrderTest')
+}
+
+// java-only: 堆压力下的短串驻留回收验证。必须限小堆——SoftReference 只在堆压力下清除，
+//   默认堆太大则永不触发，测不出「可回收」这一关键性质。
+tasks.register('internPressureTests', JavaExec) {
+    group = 'verification'
+    description = '限小堆制造压力，验证短串驻留表可被回收（旧的永久钉住实现下必失败）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.InternPressureTest')
+    jvmArgs('-Xmx256m')
+}
+
+// java-only: 经 luajava 用过的类，其 ClassLoader 必须可回收。bind/ 下五张只增不减的
+//   static 缓存键为 Method/Constructor/Class，会强引用声明类进而钉住其 ClassLoader。
+tasks.register('classLoaderRetentionTests', JavaExec) {
+    group = 'verification'
+    description = '验证经 luajava 调用过的自定义 ClassLoader 在丢弃后可被回收。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ClassLoaderRetentionTest')
+}
+
+// java-only: 编译器 FuncState 池不得滞留长大的 kcache 表（HashMap 容量只增不减）。
+//   需 --add-opens 读 HashMap.table 精确量化容量（仅测试用，不影响生产运行）。
+tasks.register('kcacheRetentionTests', JavaExec) {
+    group = 'verification'
+    description = '验证编译器 FuncState 池不滞留长大的 kcache HashMap。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.KCacheRetentionTest')
+    jvmArgs '--add-opens', 'java.base/java.util=ALL-UNNAMED'
+}
+
+// java-only: GC 的 atomic 相位必须清死栈片段并收缩非运行线程的栈。
+//   曾两处泄漏：markThreadFrames 只标到 top、不清其上的槽（Java 强引用钉死对象）；
+//   shrinkstack/shrinkCI 从未接入 GC（容量停峰值）。
+tasks.register('stackRetentionTests', JavaExec) {
+    group = 'verification'
+    description = '验证 atomic 相位清死栈片段，且非运行线程的栈与 CallInfo 链会回落。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.StackRetentionTest')
+}
+
+// java-only: gsub 的 MatchState free-list 须有容量上限。
+//   ThreadLocal 常驻 + 支持重入（gsub 回调可再调 gsub）⇒ 无上限时高水位 = 历史最大
+//   嵌套深度，每个 MatchState 约 300 字节且永不回落。对齐 Parser.FS_POOL_MAX=16。
+tasks.register('gsubPoolCapTests', JavaExec) {
+    group = 'verification'
+    description = '验证 string.gsub 的 MatchState free-list 封顶在 16。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.GsubPoolCapTest')
+}
+
+// java-only: 单个【长期存活】Globals 内部的 GC 登记表须有界。
+//   与 globalsRetentionTests 分工：那个测「Globals 整体能否回收」（宿主换 state）；
+//   本任务测「Globals 不被回收时，内部登记表会不会无界增长」——Android 单 Activity
+//   长驻脚本的真实形态。若 allProtos/allTables/allClosures 只 add 不 remove 即真泄漏。
+// java-only: luajvm-core 的包依赖矩阵（白名单即架构债台账）。
+tasks.register('coreLayerContractTests', JavaExec) {
+    group = 'verification'
+    description = '验证 luajvm-core 的包依赖矩阵无新增反向边（core→lib/bind 等）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.CoreLayerContractTest')
+}
+
+// java-only: FlatLoop 预扩容不得改变可观察表形状（T.querytab 与 C 逐项一致）。
+tasks.register('flatShapeTests', JavaExec) {
+    group = 'verification'
+    description = '验证 FlatLoop 纯写填充预扩容的表形状与 C（ltests T.querytab）一致。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.FlatShapeFidelityTest')
+}
+
+tasks.register('longLivedGlobalsTests', JavaExec) {
+    group = 'verification'
+    description = '验证长驻 Globals 内部的 GC 登记表（allProtos/allTables/allClosures）会回落。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LongLivedGlobalsTest')
+}
+// java-only: 把 Continuation 相关的 JVM flag 从任务里剔除。
+//   两个「期望 SUPPORTED=false」的门禁必须不受全局 -Pcont=true 影响 ——
+//   否则 configureClassDirectoryTest 的透传会给它们也加上 flag/导出，
+//   令 SUPPORTED 变 true 而与期望冲突（门禁自相矛盾，非回归）。
+def stripContFlags = { JavaExec task ->
+    task.doFirst {
+        def out = []
+        def args = task.jvmArgs
+        for (int i = 0; i < args.size(); i++) {
+            def a = args[i]
+            if (a == '--add-exports' && i + 1 < args.size()
+                    && args[i + 1] == 'java.base/jdk.internal.vm=ALL-UNNAMED') {
+                i++          // 连带跳过它的值
+                continue
+            }
+            if (a == '-Dluajvm.cont=true') continue
+            out << a
+        }
+        task.jvmArgs = out
+    }
+}
+
+
+// java-only: GC 回收 yielded 协程时必须终止其执行线程。
+//   曾泄漏：closeFromCollector 只清 Lua 状态，未让 lua_yieldk 跳出 `while (status ==
+//   LUA_YIELD) await()`（只设 forceClose 会被循环条件挡住），线程永久 park。park 着的
+//   线程是 GC 根 → LuaThread 及其对象图永不回收；Android 平台线程模式下还泄漏真实 OS 线程。
+tasks.register('coroThreadLeakTests', JavaExec) {
+    group = 'verification'
+    description = '验证 GC 回收 yielded 协程时其执行线程会终止（虚拟线程模式）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.CoroThreadLeakTest')
+    // 必须钉死线程模式：本门禁在 cont 模式下会自行 SKIP（该模式结构上不建线程），
+    //   而 configureClassDirectoryTest 会把全局 -Pcont=true 透传成 -Dluajvm.cont=true
+    //   ⇒ 不设防则 `gradlew ... -Pcont=true` 下本门禁静默 SKIP 报 PASS，
+    //   真实的协程线程泄漏被完全遮蔽（实测缺陷态下仍 EXIT=0）。
+    //   cont 路径由 contSupportOnTests 单独覆盖。
+    stripContFlags(delegate)
+}
+
+// 平台线程模式复测（Android 的真实配置：ART/Dalvik 无虚拟线程，回退 new Thread）。
+tasks.register('coroThreadLeakPlatformTests', JavaExec) {
+    group = 'verification'
+    description = '同上，但强制平台线程（-Dluajvm.vthread=false），对齐 Android 配置。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.CoroThreadLeakTest')
+    jvmArgs('-Dluajvm.vthread=false')
+    // 同 coroThreadLeakTests：不受全局 -Pcont 影响。本任务判别力最强
+    //   （唯一直接按线程名计数真实 OS 线程），被 SKIP 遮蔽的代价最大。
+    stripContFlags(delegate)
+}
+
+// java-only: ThreadLocal 对象池归还时必须清对源数据的引用。
+//   C 里 LexState/MatchState 是栈分配局部变量，函数返回即消失；Java 为消除分配把它们
+//   池化到 ThreadLocal，于是归还时漏清的字段随池永久滞留，且每线程一份。
+//   反射读池内实例字段，故需 --add-opens。
+tasks.register('poolRetentionTests', JavaExec) {
+    group = 'verification'
+    description = '验证 Lexer/MatchState 归还池时清除源字节数组与 Reader 引用。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.PoolRetentionTest')
+}
+
+// java-only: 打开的文件句柄登记表有界性。曾只增不减——close() 不摘除表项。
+tasks.register('ioHandleLeakTests', JavaExec) {
+    group = 'verification'
+    description = '验证 close 与 __gc 两条路径都会把句柄从打开登记表摘除。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.IoHandleLeakTest')
+}
+
+// java-only: 被丢弃的 Globals 必须可回收（Android 上每 Activity 一个状态、销毁时只丢引用）。
+tasks.register('globalsRetentionTests', JavaExec) {
+    group = 'verification'
+    description = '验证丢弃强引用后 Globals 可被 JVM 回收且登记表计数回落。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.GlobalsRetentionTest')
+}
+
+tasks.register('concurrencyTests', JavaExec) {
+    group = 'verification'
+    description = '模拟 Android 场景的并发契约测试：createProxy 回调多线程调用、多 Globals 并行。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ConcurrencyScenarioTest')
+}
+
+tasks.named('officialAllTests') {
+    mustRunAfter 'lua55DebugTests'
+}
+
+tasks.named('officialTests') {
+    mustRunAfter 'officialAllTests'
+}
+
+tasks.named('luajvmTests') {
+    mustRunAfter 'officialTests'
+}
+
+tasks.named('javaApiTests') {
+    mustRunAfter 'luajvmTests'
+}
+
+tasks.named('concurrencyTests') {
+    mustRunAfter 'javaApiTests'
+}
+
+// java-only: C 闭包（LUA_VCCL）upvalue 槽的 GC 可见性门禁。
+//   propagateOne 的 LUA_VCCL 分支只遍历 gcRefs()，若 LuaCClosure 不覆写它，
+//   upvalue[] 里的对象在标记阶段完全不可见 -> 被 sweep 摘除并提前跑 __gc。
+tasks.register('cclosureMarkTests', JavaExec) {
+    group = 'verification'
+    description = '验证 C 闭包 upvalue 槽被 GC 标记（含 Lua 闭包对照组）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.CClosureUpvalueMarkTest')
+}
+
+// java-only: 宿主侧 callLua 入口的栈回收门禁（成功与错误两条路径）。
+//   成功路径：打包成 Varargs 后必须退回 top 并清槽，否则每次宿主调用永久留 nres 个槽，
+//   top 单调上涨使 shrinkStackForGc 条件永不成立（栈永不收缩），滞留槽还钉死返回值。
+//   错误路径：宿主 catch(LuaError) 后须走 luaD_pcall 恢复段，否则 top/CallInfo 链同样无界。
+tasks.register('hostCallStackBoundTests', JavaExec) {
+    group = 'verification'
+    description = '验证宿主 callLua 入口退回栈（成功/错误两条路径的栈有界 + 返回值可回收）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.HostCallStackBoundTest')
+}
+
+// java-only: JavaClass 的三张 accessTypeCache 有界性门禁。
+//   集合（Map/List）的 key 是用户数据的任意键而非类成员名，按键缓存会让
+//   条目数随互异键数无界增长，且缓存与 Globals 同寿。
+tasks.register('accessCacheBoundTests', JavaExec) {
+    group = 'verification'
+    description = '验证 accessTypeCache 不随任意键无界增长（含语义与判别力前置）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.AccessCacheBoundTest')
+}
+
+tasks.register('methodGroupCacheTests', JavaExec) {
+    group = 'verification'
+    description = '验证 JavaClass 按实际方法名构建包装且缺失方法负缓存有界。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.MethodGroupCacheTest')
+}
+
+// java-only: bind 层分派成本基准（仅证收益上界与 A/B，不是门禁）。
+//   用法：gradlew :luajvm-core:bindBench --args="<case> [iters]"
+//   case: ctor_frame2|ctor_frame1|ctor_frame0|member_frame1|member_frame0|set_str|set_int
+//         |get_str|tojstring|javaclass_get|mh_build|refl_build|layout_host[_cold]
+//         |settings_like[_warm|_cold]|jclass_rebuild|jclass_reuse|globals_only|perglobals
+//   验收纪律：每个 case 必须独立进程连续跑 N 次取中位，两组之间不交错
+//   ，且只认区间不重叠的读数。
+tasks.register('bindBench', JavaExec) {
+    group = 'verification'
+    description = 'bind 层分派成本基准（参数：<case> [iters]），用于 A/B 与收益上界测算。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.BindDispatchBench')
+}
+
+// java-only: 冷启动加载成本基准（源码编译 vs 预编译 undump），不是门禁。
+//   用法：gradlew :luajvm-core:coldStartBench --args="<脚本根目录>"
+//   只测 load 不执行模块体：模块体会调 Android API，JVM 侧跑不了，且与预编译无关。
+tasks.register('coldStartBench', JavaExec) {
+    group = 'verification'
+    description = '冷启动加载成本基准（参数：<脚本根目录>）：源码编译 vs 预编译字节码 undump。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.BenchColdStart')
+}
+
+// java-only: 进程级缓存的 ClassLoader 分层判据门禁（2026-08-20）。
+//   两个方向都钉住：不能漏收（与进程同寿的 loader ⇒ 性能）、不能多收（自定义子 loader ⇒ 泄漏）。
+//   判别力分布见类注释：子 loader 那组在 JVM 有判别力，引擎 loader 那组只在 Android 有。
+tasks.register('loaderCacheTests', JavaExec) {
+    group = 'verification'
+    description = '验证 JavaMethod.cacheable 的 ClassLoader 分层判据（收与不收两个方向）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.LoaderCacheTest')
+}
+
+// java-only: bind 层四条快路径的行为等价 + 内存性质门禁（2026-08-20）。
+//   覆盖 strjcache / bindmhlazy / bindfastcall / bindargs；判别力前置内建在用例里
+//   （非 ASCII 的 UTF-8 与 Latin-1 解读必须不同，否则 ASCII 误判的断言是空转的）。
+tasks.register('bindFastPathTests', JavaExec) {
+    group = 'verification'
+    description = '验证 bind 层快路径（toJavaString 缓存、MH 惰性、直调、receiver 打包）行为等价且缓存不引入进程级表。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.BindFastPathTest')
+}
+
+tasks.register('coercionScoreTests', JavaExec) {
+    group = 'verification'
+    description = '钉住 Coercion.scoreParams 的重载打分与基元零值精确装箱类型（LuaClassProxy 依赖）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.CoercionScoreTest')
+}
+
+// ── 测试分两层：runCoreTests（纯 JVM）/ runAndroidTests（真机 APK） ─────────────
+//   分层判据是「测试需要什么运行时」，不是「代码属于哪个模块」：
+//   能在纯 JVM 上诚实判定的一律留在本层（秒级、无设备也能跑、可进 check）；
+//   只有真需要 Context/Activity/dexmaker/WebView 的才上 APK（见 docs/GATES.md 分层表）。
+tasks.register('runCoreTests') {
+    group = 'verification'
+    description = '纯 JVM 全量门禁：lua55-debug 对照、官方测试、Java 绑定测试、Java API、并发、各项驻留门禁，及 android 侧合约门禁与 JVM 单测。'
+    dependsOn 'lua55DebugTests', 'officialAllTests', 'officialTests', 'luajvmTests',
+            'javaApiTests', 'chunkTests', 'contModeTests', 'concurrencyTests', 'internPressureTests',
+            'classInitOrderTests', 'globalsRetentionTests', 'ioHandleLeakTests',
+            'classLoaderRetentionTests', 'kcacheRetentionTests', 'stackRetentionTests',
+            'coroThreadLeakTests', 'coroThreadLeakPlatformTests', 'poolRetentionTests',
+            'contSupportOffTests', 'contSupportNoExportTests', 'contSupportOnTests',
+            'cclosureMarkTests', 'accessCacheBoundTests', 'methodGroupCacheTests', 'hostCallStackBoundTests',
+            'gsubPoolCapTests', 'longLivedGlobalsTests', 'bindFastPathTests', 'loaderCacheTests',
+            'coercionScoreTests', 'flatShapeTests', 'coreLayerContractTests',
+            // android 侧四个静态门禁（layer/host/threadEntry/baselineProfile）在
+            //   luajvm-android 的 test 源集，由其 testDebugUnitTest 经 JUnit 包装执行
+            ':luajvm-android:testDebugUnitTest'
+}
+
+// android 侧门禁的手动别名（androidGates = runCoreTests 的 android 子集）。
+//   runCoreTests 本身已含 android 侧且零漏跑：android 源码未改动时 compile/单测均
+//   UP-TO-DATE、三个合约门禁各 1-2s（实测整体 +2s）；改动 android 时这些成本
+//   本来就是必须支付的验证。单独跑 android 侧用 androidGates 即可。
+tasks.register('androidGates') {
+    group = 'verification'
+    description = 'android 侧纯 JVM 门禁手动别名：layer/host/threadEntry/baselineProfile 合约 + 平台层单测。'
+    dependsOn ':luajvm-android:testDebugUnitTest'
+}
+
+check.dependsOn 'runCoreTests'
+
+
+// java-only: ContSupport 三态门禁（协程第三模式的启用判据）。
+//   三态各对应一个真实部署场景，见 ContSupportTest 类注释。
+//   第 2 态最关键：类能 Class.forName 到但跨模块调用会失败，若误判 true 则运行期才炸。
+tasks.register('contSupportOffTests', JavaExec) {
+    group = 'verification'
+    description = '无 -Dluajvm.cont：SUPPORTED 须为 false（默认部署走原线程实现）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ContSupportTest')
+    jvmArgs('-Dluajvm.contExpect=false')
+    stripContFlags(delegate)   // 不受全局 -Pcont 影响：本态就是「没开就必须 false」
+}
+
+tasks.register('contSupportNoExportTests', JavaExec) {
+    group = 'verification'
+    description = '有 -Dluajvm.cont 但无 --add-exports：SUPPORTED 须为 false（等价 Android/ART）。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ContSupportTest')
+    jvmArgs('-Dluajvm.cont=true', '-Dluajvm.contExpect=false')
+    // 本任务的全部意义就是「缺 --add-exports 时必须回落」，等价于 Android/ART 场景。
+    //   configureClassDirectoryTest 在 -Pcont=true 时会给所有任务加 --add-exports，
+    //   那会让本任务拿到导出、SUPPORTED 变 true 而与期望冲突（实测踩过：跑
+    //   runCoreTests -Pcont=true 时本任务 FAILED，但那是门禁自相矛盾、不是回归）。
+    //   故在此显式剔除该 flag，使本任务不受全局开关影响。
+    stripContFlags(delegate)   // 只剔 --add-exports；-Dluajvm.cont 由上面显式给
+    doFirst { jvmArgs = jvmArgs + '-Dluajvm.cont=true' }
+}
+
+tasks.register('contSupportOnTests', JavaExec) {
+    group = 'verification'
+    description = 'flag 与 --add-exports 齐备：SUPPORTED 须为 true，并验 yield 序列与不占线程。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ContSupportTest')
+    jvmArgs('-Dluajvm.cont=true', '-Dluajvm.contExpect=true',
+            '--add-exports', 'java.base/jdk.internal.vm=ALL-UNNAMED')
+}
+
+// java-only: Continuation 模式下的协程语义（contSupportOnTests 只验 SUPPORTED 与 yield 序列）。
+//   五项：yield/resume、嵌套协程、错误传播、挂起态可被 GC 回收、状态机转移。
+//   用例在模式未启用时打印 SKIP 并返回 0，故本任务捕获输出、见 SKIP 即失败——
+//   否则 jvmArgs 漏配会让门禁一行不跑还全绿。
+tasks.register('contModeTests', JavaExec) {
+    group = 'verification'
+    description = 'Continuation 模式协程语义：yield/resume、嵌套、错误传播、GC、状态转移。'
+    configureClassDirectoryTest(delegate, 'org.luajvm.test.ContinuationModeTest')
+    jvmArgs('-Dluajvm.cont=true',
+            '--add-exports', 'java.base/jdk.internal.vm=ALL-UNNAMED')
+    def captured = new ByteArrayOutputStream()
+    standardOutput = new org.apache.tools.ant.util.TeeOutputStream(System.out, captured)
+    doLast {
+        if (captured.toString().contains('SKIP')) {
+            throw new GradleException('contModeTests: Continuation 模式未启用，门禁空转——检查 jvmArgs')
+        }
+    }
+}

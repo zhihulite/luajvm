@@ -1,0 +1,140 @@
+plugins {
+    id 'com.android.library'
+    id 'maven-publish'
+}
+
+android {
+    namespace 'org.luajvm.android'
+    compileSdk 37
+    defaultConfig {
+        minSdk 24
+        targetSdk 37
+        // 仪器化测试（androidTest）用 AndroidX runner；测试 APK 自 instrument 本模块，
+        //   本仓无 application 模块，测试 APK 由 AGP 从 src/androidTest 生成
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+    publishing {
+        singleVariant('release') {
+            withSourcesJar()
+            withJavadocJar()
+        }
+    }
+}
+
+// API 面闸门接到发布路径：制品出仓前必跑 lintRelease，超过 minSdk 的调用不可能进 AAR。
+//   assemble/publish 本身不触发 lint，只挂 check 的话发布流程绕得过去。
+tasks.withType(AbstractPublishToMaven).configureEach {
+    dependsOn 'lintRelease'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs.add('-Xlint:deprecation')
+    options.compilerArgs.add('-Xlint:unchecked')
+    options.encoding = 'UTF-8'
+}
+
+// ── 真机 APK 门禁：只放"纯 JVM 判不了"的用例（见 docs/GATES.md 分层表） ──────────
+//   每次跑前先卸载：全新 filesDir 才能测到 assets 解压/pm clear 语义，
+//   残留目录会让 extractAssetsIfNeeded 走错分支、把缺陷测成通过。
+tasks.register('uninstallTestApks', Exec) {
+    group = 'verification'
+    description = '卸载测试 APK（runAndroidTests 前置，保证全新 filesDir）。'
+    def sdk = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+    if (sdk == null) {
+        def props = rootProject.file('local.properties')
+        if (props.exists()) {
+            def p = new Properties()
+            props.withInputStream { p.load(it) }
+            sdk = p.getProperty('sdk.dir')
+        }
+    }
+    def adb = sdk != null ? "${sdk}/platform-tools/adb" : 'adb'
+    commandLine adb, 'uninstall', 'org.luajvm.android.test'
+    // 未安装时 adb 返回非零，属正常路径
+    ignoreExitValue = true
+    standardOutput = new ByteArrayOutputStream()
+    errorOutput = new ByteArrayOutputStream()
+}
+
+tasks.register('runAndroidTests') {
+    group = 'verification'
+    description = '真机/模拟器 APK 门禁：dexmaker 代理、Context/Activity 生命周期等纯 JVM 判不了的用例。需连接设备。'
+    dependsOn 'uninstallTestApks', 'connectedDebugAndroidTest'
+}
+// connectedDebugAndroidTest 由 AGP 在 variant 装配后才注册，故延后接线
+afterEvaluate {
+    tasks.named('connectedDebugAndroidTest') { mustRunAfter 'uninstallTestApks' }
+}
+
+dependencies {
+    api project(':luajvm-core')
+    androidTestImplementation libs.androidx.test.junit
+    androidTestImplementation libs.androidx.test.rules
+    androidTestImplementation libs.androidx.test.runner
+    androidTestImplementation libs.junit
+    annotationProcessor libs.glide.compiler
+    // 重合宿主依赖以 api 暴露：宿主应用删除自有声明后由本库统一
+    //   传递提供，版本单一来源，避免宿主与本库各自声明产生仲裁冲突
+    api libs.androidx.activity
+    api libs.androidx.appcompat
+    api libs.androidx.appcompat.resources
+    api libs.androidx.core
+    api libs.androidx.fragment
+    api libs.androidx.recyclerview
+    api libs.androidx.splashscreen
+    api libs.androidx.swiperefresh
+    api libs.androidx.transition
+    api libs.androidx.viewpager
+    api libs.androidx.viewpager2
+    api libs.androidx.webkit
+    implementation libs.androidx.documentfile
+    implementation libs.androidx.preference
+    implementation libs.dexmaker
+    api libs.glide
+    api libs.material
+    api libs.photoview
+    testImplementation libs.junit
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                // groupId/version 由根 build.gradle 统一设定
+                artifactId = 'luajvm-android'
+                pom {
+                    name = 'luajvm-android'
+                    description = 'luajvm 的 Android 平台层：Activity/布局/控件绑定与 Lua 侧 API 面。'
+                    url = 'https://github.com/zhihulite/luajvm'
+                    licenses {
+                        license {
+                            name = 'MIT License'
+                            url = 'https://github.com/zhihulite/luajvm/blob/main/LICENSE'
+                        }
+                    }
+                    developers {
+                        developer {
+                            id = 'zhihulite'
+                            name = 'zhihulite'
+                        }
+                    }
+                    scm {
+                        url = 'https://github.com/zhihulite/luajvm'
+                        connection = 'scm:git:https://github.com/zhihulite/luajvm.git'
+                    }
+                }
+            }
+        }
+    }
+}

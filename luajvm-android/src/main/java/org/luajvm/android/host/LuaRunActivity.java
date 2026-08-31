@@ -1,0 +1,194 @@
+package org.luajvm.android.host;
+
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.provider.Settings;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.RequiresApi;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+
+import java.io.File;
+
+/**
+ * 外部脚本执行入口：IDE/调试器经 URI 拉起，处理存储权限后转发
+ * {@link LuaActivity} 执行。域外脚本在 LuaActivity 侧（ActivityDelegate.initEngine
+ * 对 URI data 与 luaPath extra 两条入口统一拦截）经用户确认后才执行。
+ */
+public class LuaRunActivity extends AppCompatActivity {
+
+    private static final int REQUEST_CODE_MANAGE_STORAGE = 1001;
+    private static final int REQUEST_CODE_READ_STORAGE = 1002;
+
+    private String luaPath;
+    private String arg;
+    private String name;
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        Intent intent = getIntent();
+        luaPath = intent.getData() != null ? intent.getData().getPath() : null;
+        // IDE 调试传入的工程路径中脚本目录为 assets_bin，实际源码在 assets 下
+        if (luaPath != null && luaPath.contains("/assets_bin/")) {
+            luaPath = luaPath.replace("/assets_bin/", "/assets/");
+        }
+        arg = intent.getStringExtra("arg");
+        name = intent.getStringExtra("name");
+
+        String fileName = luaPath != null ? new File(luaPath).getName() : "未知";
+        Toast.makeText(this, "即将执行「" + fileName + "」", Toast.LENGTH_LONG).show();
+
+        runLua();
+    }
+
+    private void runLua() {
+        try {
+            if (luaPath == null || luaPath.isEmpty()) {
+                showErrorAndExit("文件路径为空");
+                return;
+            }
+
+            File file = new File(luaPath);
+            if (!file.exists()) {
+                showErrorAndExit("文件不存在: " + luaPath);
+                return;
+            }
+
+            if (!file.canRead()) {
+                requestStoragePermission();
+                return;
+            }
+
+            startLuaActivity();
+
+        } catch (Exception e) {
+            showErrorAndExit("错误: " + e.getMessage());
+        }
+    }
+
+    private void requestStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ 需管理全部文件权限
+            if (!Environment.isExternalStorageManager()) {
+                showManageStorageDialog();
+            } else {
+                showErrorAndExit("文件无法读取，请检查文件是否损坏");
+            }
+        } else {
+            // Android 6-10 需运行时权限
+            if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.READ_EXTERNAL_STORAGE},
+                        REQUEST_CODE_READ_STORAGE);
+            } else {
+                showErrorAndExit("文件无法读取，请检查文件是否损坏");
+            }
+        }
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.R)
+    private void showManageStorageDialog() {
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("需要存储权限")
+                .setMessage("调试Lua需要「管理全部文件」权限，请点击「去授权」并手动开启权限")
+                .setPositiveButton("去授权", (d, w) -> {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivityForResult(intent, REQUEST_CODE_MANAGE_STORAGE);
+                })
+                .setNegativeButton("取消", (d, w) -> showErrorAndExit("未获得存储权限，无法调试Lua"))
+                .setCancelable(false)
+                .show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_CODE_READ_STORAGE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                runLua();
+            } else {
+                showErrorAndExit("未获得存储权限，无法调试Lua");
+            }
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CODE_MANAGE_STORAGE) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (Environment.isExternalStorageManager()) {
+                    runLua();
+                } else {
+                    showErrorAndExit("未获得「管理全部文件」权限，无法调试Lua");
+                }
+            }
+        }
+    }
+
+    /**
+     * 转发目标：宿主 manifest 注册的是自己的 LuaActivity 子类，固定基类会因
+     * 未注册而启动失败。取包内已注册、距基类继承深度最浅的子类（宿主的
+     * LuaActivity 是直接子类；launcher 等业务页继承更深，自然让位）。
+     */
+    private Class<?> resolveLuaActivity() {
+        Class<?> best = null;
+        int bestDepth = Integer.MAX_VALUE;
+        try {
+            var info = getPackageManager().getPackageInfo(getPackageName(),
+                    PackageManager.GET_ACTIVITIES);
+            for (var ai : info.activities) {
+                try {
+                    Class<?> c = Class.forName(ai.name);
+                    if (c == LuaActivity.class || !LuaActivity.class.isAssignableFrom(c)) continue;
+                    int depth = 0;
+                    for (Class<?> k = c.getSuperclass(); k != null && k != LuaActivity.class; k = k.getSuperclass()) {
+                        depth++;
+                    }
+                    if (depth < bestDepth) {
+                        bestDepth = depth;
+                        best = c;
+                    }
+                } catch (ClassNotFoundException ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return best != null ? best : LuaActivity.class;
+    }
+
+    private void startLuaActivity() {
+        Intent newIntent = new Intent(this, resolveLuaActivity());
+        newIntent.putExtra("arg", arg);
+        newIntent.putExtra("name", name);
+        newIntent.putExtra("luaPath", luaPath);
+        newIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT);
+        newIntent.addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+        newIntent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
+        startActivity(newIntent);
+        finishAndRemoveTask();
+    }
+
+    private void showErrorAndExit(String msg) {
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+        new MaterialAlertDialogBuilder(this)
+                .setTitle("无法调试Lua")
+                .setMessage(msg)
+                .setPositiveButton("确认", (d, w) -> finish())
+                .setCancelable(false)
+                .show();
+    }
+}
